@@ -48,17 +48,30 @@ export const generateRoadmap = async (topic: string, parentTopic: string | null)
     });
 
     const jsonText = response.text.trim();
-    const roadmapData = JSON.parse(jsonText);
+    const parsed = JSON.parse(jsonText);
     
-    if (Array.isArray(roadmapData) && roadmapData.every(item => typeof item.title === 'string' && typeof item.description === 'string')) {
-      return roadmapData as RawRoadmapStep[];
-    } else {
-      console.error("Parsed JSON does not match expected structure:", roadmapData);
-      throw new Error("AI response was not in the expected format.");
+    if (!Array.isArray(parsed)) {
+      throw new Error("Invalid response format: expected an array");
     }
 
+    return parsed.map((item: unknown) => {
+      if (typeof item !== 'object' || item === null) {
+        throw new Error("Invalid roadmap item");
+      }
+      const roadmapItem = item as Record<string, unknown>;
+      const title = roadmapItem.title;
+      const description = roadmapItem.description;
+      
+      if (typeof title !== 'string' || typeof description !== 'string') {
+        throw new Error("Invalid roadmap item: missing title or description");
+      }
+      
+      return { title: title.trim(), description: description.trim() };
+    });
   } catch (error) {
-    console.error("Error generating roadmap:", error);
-    throw new Error("Failed to generate roadmap from AI. The API key might be invalid or the service may be unavailable.");
+    if (error instanceof Error) {
+      throw new Error(`Failed to generate roadmap: ${error.message}`);
+    }
+    throw new Error("Failed to generate roadmap: Unknown error");
   }
 };
