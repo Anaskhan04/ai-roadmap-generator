@@ -1,11 +1,9 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { generateRoadmap } from './services/geminiService';
 import { RoadmapItem } from './types';
 import RoadmapNode from './components/RoadmapNode';
 import { LoadingSpinner, SparklesIcon } from './components/IconComponents';
-
-// Helper to create URL-friendly slugs
-const slugify = (text: string) => text.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
+import { mapStepsToRoadmapItems, updateNodeInTree } from './utils';
 
 const App: React.FC = () => {
   const [topic, setTopic] = useState('');
@@ -15,6 +13,120 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [exploringNodeId, setExploringNodeId] = useState<string | null>(null);
 
+  const getCoreErrorMessage = (err: unknown): string => {
+    if (!(err instanceof Error)) {
+      return 'Something went wrong. Please try again.';
+    }
+
+    let message = err.message || '';
+    let lower = message.toLowerCase();
+
+    const failedPrefix = 'failed to generate roadmap:';
+    if (lower.startsWith(failedPrefix)) {
+      message = message.slice(failedPrefix.length).trim();
+      lower = message.toLowerCase();
+    }
+
+    if (lower.includes('gemini_api_key') || lower.includes('api key')) {
+      return 'API key not found. Please set GEMINI_API_KEY in your .env file.';
+    }
+
+    if (lower.includes('expected between')) {
+      return 'No steps were generated. Try rephrasing your topic.';
+    }
+
+    if (lower.includes('invalid response format') || lower.includes('invalid roadmap item')) {
+      return 'The AI returned an unexpected format. Try a simpler topic or try again.';
+    }
+
+    if (lower.includes('taking too long') || lower.includes('timeout')) {
+      return 'The AI took too long to respond. Please try again.';
+    }
+
+    return message;
+  };
+
+  const buildErrorMessage = (err: unknown, context: 'root' | 'explore'): string => {
+    const core = getCoreErrorMessage(err);
+
+    if (context === 'root') {
+      return `Could not generate roadmap: ${core}`;
+    }
+
+    return `Could not explore deeper: ${core}`;
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const raw = window.localStorage.getItem('ai-roadmap-state');
+    if (!raw) return;
+
+    try {
+      const parsed = JSON.parse(raw) as {
+        topic?: string;
+        mainTopic?: string;
+        roadmap?: RoadmapItem[];
+      };
+
+      if (parsed && parsed.roadmap && Array.isArray(parsed.roadmap)) {
+        setTopic(parsed.topic ?? '');
+        setMainTopic(parsed.mainTopic ?? '');
+        setRoadmap(parsed.roadmap);
+      }
+    } catch {
+      // Ignore invalid persisted state
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    if (!roadmap || !mainTopic) {
+      window.localStorage.removeItem('ai-roadmap-state');
+      return;
+    }
+
+    const payload = JSON.stringify({ topic, mainTopic, roadmap });
+    window.localStorage.setItem('ai-roadmap-state', payload);
+  }, [topic, mainTopic, roadmap]);
+
+  const handleCopyMarkdown = async () => {
+    if (!roadmap || typeof window === 'undefined' || !navigator.clipboard) return;
+
+    const buildMarkdown = (items: RoadmapItem[], level = 0): string => {
+      const indent = '  '.repeat(level);
+      return items
+        .map((item) => {
+          const line = `${indent}- ${item.title}: ${item.description}`;
+          const children = item.children && item.children.length > 0
+            ? `\n${buildMarkdown(item.children, level + 1)}`
+            : '';
+          return line + children;
+        })
+        .join('\n');
+    };
+
+    const markdown = `# Learning Roadmap for ${mainTopic || topic}\n\n${buildMarkdown(roadmap)}`;
+
+    try {
+      await navigator.clipboard.writeText(markdown);
+    } catch {
+      // Best-effort copy; silently fail if not available
+    }
+  };
+
+  const handleCopyJson = async () => {
+    if (!roadmap || typeof window === 'undefined' || !navigator.clipboard) return;
+
+    const json = JSON.stringify({ topic: mainTopic || topic, roadmap }, null, 2);
+
+    try {
+      await navigator.clipboard.writeText(json);
+    } catch {
+      // Best-effort copy; silently fail if not available
+    }
+  };
 
   const handleGenerateRoadmap = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -25,14 +137,11 @@ const App: React.FC = () => {
     setRoadmap(null);
     try {
       const result = await generateRoadmap(topic, null);
-      const roadmapWithIds: RoadmapItem[] = result.map((item, index) => ({
-        ...item,
-        id: `${slugify(item.title)}-${index}`,
-      }));
+      const roadmapWithIds: RoadmapItem[] = mapStepsToRoadmapItems(result);
       setRoadmap(roadmapWithIds);
       setMainTopic(topic);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to generate roadmap');
+      setError(buildErrorMessage(err, 'root'));
     } finally {
       setLoading(false);
     }
@@ -40,14 +149,14 @@ const App: React.FC = () => {
 
   const handleToggleExpand = useCallback(async (id: string, subTopic: string, hasChildren: boolean, isExpanded: boolean) => {
     if (!hasChildren && !isExpanded) {
+      if (exploringNodeId === id) {
+        return;
+      }
       setExploringNodeId(id);
       setError(null);
       try {
         const result = await generateRoadmap(subTopic, mainTopic);
-        const newChildren: RoadmapItem[] = result.map((item, index) => ({
-          ...item,
-          id: `${id}-${slugify(item.title)}-${index}`
-        }));
+        const newChildren: RoadmapItem[] = mapStepsToRoadmapItems(result, id);
         
         setRoadmap(prevRoadmap => {
           if (!prevRoadmap) return null;
@@ -57,7 +166,7 @@ const App: React.FC = () => {
           });
         });
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to explore deeper');
+        setError(buildErrorMessage(err, 'explore'));
       } finally {
         setExploringNodeId(null);
       }
@@ -69,22 +178,7 @@ const App: React.FC = () => {
         });
       });
     }
-  }, [mainTopic]);
-
-  const updateNodeInTree = (nodes: RoadmapItem[], targetId: string, updates: Partial<RoadmapItem>): RoadmapItem[] => {
-    return nodes.map(node => {
-      if (node.id === targetId) {
-        return { ...node, ...updates };
-      }
-      if (node.children) {
-        return {
-          ...node,
-          children: updateNodeInTree(node.children, targetId, updates)
-        };
-      }
-      return node;
-    });
-  };
+  }, [mainTopic, exploringNodeId]);
 
   return (
     <div className="min-h-screen container mx-auto p-4 md:p-8 flex flex-col items-center">
@@ -122,6 +216,24 @@ const App: React.FC = () => {
           </button>
         </form>
 
+        {!roadmap && !loading && (
+          <div className="mb-6 text-sm text-slate-400 animate-fade-in">
+            <p>Try one of these example topics:</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {['Full-stack Web Development', 'Data Science', 'UI/UX Design', 'Machine Learning from Scratch'].map((example) => (
+                <button
+                  key={example}
+                  type="button"
+                  onClick={() => setTopic(example)}
+                  className="px-3 py-1 rounded-full border border-slate-700 text-slate-200 hover:border-cyan-500 hover:text-cyan-300 transition-colors text-xs md:text-sm"
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {error && (
           <div className="bg-red-900/50 border border-red-700 text-red-300 px-4 py-3 rounded-lg text-center animate-fade-in">
             <strong>Error:</strong> {error}
@@ -133,6 +245,22 @@ const App: React.FC = () => {
             <h2 className="text-3xl font-bold text-center mb-8 animate-fade-in">
               Learning Roadmap for: <span className="text-cyan-400">{mainTopic}</span>
             </h2>
+
+            <p className="text-center text-slate-400 text-sm mb-6 animate-fade-in">
+              Click <span className="font-semibold">Explore Deeper</span> on any step to break it into more detailed sub-steps.
+            </p>
+
+            <div className="flex flex-wrap justify-center gap-3 mb-8 animate-fade-in">
+              <button
+                type="button"
+                onClick={handleCopyMarkdown}
+                className="px-4 py-2 text-sm font-medium text-white bg-slate-700 rounded-full hover:bg-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-cyan-500 transition-colors"
+              >
+                Copy roadmap 
+              </button>
+              
+            </div>
+
             {roadmap.map((item) => (
               <RoadmapNode
                 key={item.id}
